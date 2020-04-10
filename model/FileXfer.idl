@@ -1,0 +1,16 @@
+const short MAX_MSG_LENGTH = 8000;
+const string file_xfer_topic = "file_xfer";
+
+struct file_xfer {
+  string filename; //@key
+
+  long total_bytes; // Total size of file
+  long remaining_bytes;   // Remaining bytes, including the current sample
+                    // The total is really associated with the file,
+                    // not the current sample, but sending it with the
+                    // sample means we don't need to manage the state
+                    // of active file transfers.  The performance
+                    // penalty is negligible, as long is much smaller
+                    // than a typical file chunk anyway
+  sequence<octet, MAX_MSG_LENGTH> chunk;
+};//@Extensibility EXTENSIBLE_EXTENSIBILITY 
