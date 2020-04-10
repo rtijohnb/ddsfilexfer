@@ -43,6 +43,8 @@ add and remove them dynamically from the domain.
 #include "FileXferSupport.h"
 #include "ndds/ndds_cpp.h"
 
+int send_file(const char* filename, file_xferDataWriter* writer);
+
 /* Delete all entities */
 static int publisher_shutdown(
     DDSDomainParticipant *participant)
@@ -80,6 +82,100 @@ static int publisher_shutdown(
     return status;
 }
 
+/* Writes out a file using the given datawriter
+   Returns 0 on success, <0 for errors
+*/
+int send_file(const char* filename, file_xferDataWriter* writer) {
+    DDS_ReturnCode_t retcode;
+
+    file_xfer *instance = file_xferTypeSupport::create_data();
+
+    if (instance == NULL) {
+        printf("file_xferTypeSupport::create_data error\n");
+        return -1;
+    }
+
+    FILE* pInFile = fopen(filename, "rb");
+    if(pInFile == NULL) {
+        printf("fopen error for '%s'\n", filename);
+        return -2;
+    }
+
+    strcpy(instance->filename, filename);
+    fseek(pInFile, 0, SEEK_END);
+    instance->remaining_bytes = 
+        instance->total_bytes = ftell(pInFile);
+    rewind(pInFile);
+    
+    char *buf = new char[MAX_MSG_LENGTH];
+    instance->chunk.maximum(0);
+    instance->chunk.loan_contiguous((DDS_Octet*)buf, 0, MAX_MSG_LENGTH);
+
+    printf("fileSize = %d\n", instance->total_bytes);
+
+    DDS_InstanceHandle_t instance_handle = writer->register_instance(*instance);
+    DDS_Duration_t sleep_period = {0, 5000000};
+    static const long bigchunk = 100*1024;
+    long next_pause = instance->remaining_bytes - bigchunk;
+
+    while (instance->remaining_bytes > 0) {
+        if (instance->remaining_bytes < next_pause) {
+            NDDSUtility::sleep(sleep_period);
+            next_pause -= bigchunk;
+        }
+
+        long len = (instance->remaining_bytes > MAX_MSG_LENGTH) ?
+            MAX_MSG_LENGTH : instance->remaining_bytes;
+        if (fread(buf, 1, len, pInFile) != len) {
+            printf("read error\n");
+            return -3;            
+        }
+
+        // read OK, update sample
+        instance->chunk.length(len);
+        instance->remaining_bytes -= len;
+                
+        // loop if we timeout
+        do {
+            retcode = writer->write(*instance, instance_handle);
+            if (retcode == DDS_RETCODE_ERROR) {
+                printf("write error\n");
+                return -4;
+            }
+        } while (retcode == DDS_RETCODE_TIMEOUT);
+    }
+
+    DDS_Duration_t timeout = {10, 0};
+    retcode = writer->wait_for_asynchronous_publishing(timeout);
+    if (retcode != DDS_RETCODE_OK) {
+        if (retcode == DDS_RETCODE_TIMEOUT) {
+            printf("wait_for_async_pub timeout\n");
+        } else {
+            printf("wait_for_async_pub error %d\n", retcode);
+        }
+        return -5;
+    }
+
+    retcode = writer->dispose(*instance, instance_handle);
+    if (retcode != DDS_RETCODE_OK) {
+        printf("dispose error %d\n", retcode);
+    }
+
+    instance->chunk.unloan();
+    delete[] buf;
+    /* Delete data sample */
+    retcode = file_xferTypeSupport::delete_data(instance);
+    if (retcode != DDS_RETCODE_OK) {
+        printf("file_xferTypeSupport::delete_data error %d\n", retcode);
+        return -5;
+    }
+
+    fclose(pInFile);
+
+    return 0;
+}
+
+
 extern "C" int publisher_main(int domainId, int sample_count)
 {
     DDSDomainParticipant *participant = NULL;
@@ -87,12 +183,17 @@ extern "C" int publisher_main(int domainId, int sample_count)
     DDSTopic *topic = NULL;
     DDSDataWriter *writer = NULL;
     file_xferDataWriter * file_xfer_writer = NULL;
-    file_xfer *instance = NULL;
+    //file_xfer *instance = NULL;
     DDS_ReturnCode_t retcode;
-    DDS_InstanceHandle_t instance_handle = DDS_HANDLE_NIL;
+    //DDS_InstanceHandle_t instance_handle = DDS_HANDLE_NIL;
     const char *type_name = NULL;
     int count = 0;  
-    DDS_Duration_t send_period = {4,0};
+    //DDS_Duration_t send_period = {4,0};
+
+    // Flow controller
+    const char *cfc_name = "Custom_Flowcontroller";
+    DDSFlowController *flowController = NULL;
+    DDS_FlowControllerProperty_t flowProperty; // Properties to configure flow controller
 
     /* To customize participant QoS, use 
     the configuration file USER_QOS_PROFILES.xml */
@@ -102,6 +203,27 @@ extern "C" int publisher_main(int domainId, int sample_count)
     if (participant == NULL) {
         fprintf(stderr, "create_participant error\n");
         publisher_shutdown(participant);
+        return -1;
+    }
+
+    // Get the properties for the default flow controller on the participant and tweak them
+    retcode = participant->get_default_flowcontroller_property(flowProperty);
+    if (retcode != DDS_RETCODE_OK)
+    {
+        printf("get_default_flowcontroller_property returned error: %d\n", retcode);
+        return -1;
+    }
+
+    flowProperty.token_bucket.period.sec                = 0;
+    flowProperty.token_bucket.period.nanosec            = 100000000;   // 100 ms
+    flowProperty.token_bucket.bytes_per_token           = 1024;
+    flowProperty.token_bucket.max_tokens                = 100;
+    flowProperty.token_bucket.tokens_added_per_period   = 100;
+    flowProperty.token_bucket.tokens_leaked_per_period  = 0;
+
+    flowController = participant->create_flowcontroller(DDS_String_dup(cfc_name), flowProperty);
+    if (flowController == NULL) {
+        printf("flow controller error\n");
         return -1;
     }
 
@@ -154,48 +276,18 @@ extern "C" int publisher_main(int domainId, int sample_count)
         return -1;
     }
 
-    /* Create data sample for writing */
-    instance = file_xferTypeSupport::create_data();
-    if (instance == NULL) {
-        fprintf(stderr, "file_xferTypeSupport::create_data error\n");
-        publisher_shutdown(participant);
-        return -1;
-    }
+    // Wait for a matched subscriber
+    DDS_Duration_t sleep_period = {1,0};
+    DDS_PublicationMatchedStatus status;
+    do {
+        file_xfer_writer->get_publication_matched_status(status);
+        NDDSUtility::sleep(sleep_period);
+    } while (status.current_count == 0);
 
-    /* For a data type that has a key, if the same instance is going to be
-    written multiple times, initialize the key here
-    and register the keyed instance prior to writing */
+    printf("Sending file\n");
+    int result = send_file("test.data", file_xfer_writer);
 
-    // instance_handle = file_xfer_writer->register_instance(*instance);
-
-    /* Main loop */
-    for (count=0; (sample_count == 0) || (count < sample_count); ++count) {
-
-        printf("Writing file_xfer, count %d\n", count);
-
-        /* Modify the data to be sent here */
-
-        retcode = file_xfer_writer->write(*instance, instance_handle);
-        if (retcode != DDS_RETCODE_OK) {
-            fprintf(stderr, "write error %d\n", retcode);
-        }
-
-        NDDSUtility::sleep(send_period);
-    }
-
-    /*
-    retcode = file_xfer_writer->unregister_instance(
-        *instance, instance_handle);
-    if (retcode != DDS_RETCODE_OK) {
-        fprintf(stderr, "unregister instance error %d\n", retcode);
-    }
-    */
-
-    /* Delete data sample */
-    retcode = file_xferTypeSupport::delete_data(instance);
-    if (retcode != DDS_RETCODE_OK) {
-        fprintf(stderr, "file_xferTypeSupport::delete_data error %d\n", retcode);
-    }
+    NDDSUtility::sleep(sleep_period);
 
     /* Delete all entities */
     return publisher_shutdown(participant);
