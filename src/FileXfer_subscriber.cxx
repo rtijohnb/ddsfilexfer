@@ -42,6 +42,9 @@ add and remove them dynamically from the domain.
 #include "FileXferSupport.h"
 #include "ndds/ndds_cpp.h"
 
+void process_data(file_xferDataReader *file_xfer_reader);
+
+
 class file_xferListener : public DDSDataReaderListener {
   public:
     virtual void on_requested_deadline_missed(
@@ -145,6 +148,89 @@ static int subscriber_shutdown(
     return status;
 }
 
+void process_data(file_xferDataReader *file_xfer_reader)
+{
+    static FILE * currentFile = NULL;
+
+    file_xferSeq data_seq;
+    DDS_SampleInfoSeq info_seq;
+    DDS_ReturnCode_t retcode;
+    DDS_LongLong pct_remain;
+    static DDS_LongLong last_pct_remain = 101;
+
+    retcode = file_xfer_reader->take(
+        data_seq, info_seq, DDS_LENGTH_UNLIMITED,
+        DDS_ANY_SAMPLE_STATE, DDS_ANY_VIEW_STATE, DDS_ANY_INSTANCE_STATE);
+
+    if (retcode == DDS_RETCODE_NO_DATA) {
+        return;
+    } else if (retcode != DDS_RETCODE_OK) {
+        printf("take error %d\n", retcode);
+        return;
+    }
+
+    for (int i = 0; i < data_seq.length(); ++i) {
+        file_xfer cur = data_seq[i];
+        if (info_seq[i].valid_data) {
+            if (info_seq[i].view_state == DDS_NEW_VIEW_STATE) {
+                // new instance means it's the first time we've seen a sample
+                // with this filename
+                
+                // To make it easier to run in the same directory, we
+                // append ".sub" to the filename
+                char buf[300];
+                sprintf(buf, "%s.sub", cur.filename);
+                printf("fopen():  %s\n  total = %d\n", cur.filename, cur.total_bytes);
+                currentFile = fopen(buf, "wb");
+            }
+
+            pct_remain = (DDS_LongLong) ((DDS_LongLong) cur.remaining_bytes * 100) / (DDS_LongLong)cur.total_bytes;
+            //printf("%d %d %d\n", cur.total_bytes, cur.remaining_bytes, pct_complete);
+            if (pct_remain != last_pct_remain)
+            {
+                if (pct_remain % 10 == 0) 
+                {
+                    //printf("Rem: %lld  %lld\n", pct_remain, last_pct_remain);
+                    printf("Rem: %lld\n", pct_remain );
+                    last_pct_remain = pct_remain;
+                }
+            }
+            
+            long len = cur.chunk.length();
+            const char *msg = reinterpret_cast<const char *>(cur.chunk.get_contiguous_buffer());
+            if (currentFile == NULL) {
+                // error
+                continue;
+            }
+
+            if (fwrite (msg, 1, len, currentFile) != len) {
+                // fwrite error
+                continue;
+            }
+        } else {
+            retcode = file_xfer_reader->get_key_value(cur, info_seq[i].instance_handle);
+            if (retcode != DDS_RETCODE_OK) {
+                printf("get_key_value error %d\n", retcode);
+                continue;
+            }
+
+            // only use the key field
+            if (info_seq[i].instance_state == DDS_NOT_ALIVE_NO_WRITERS_INSTANCE_STATE) {
+                printf("\nno writers!\n");
+            } else if (info_seq[i].instance_state == DDS_NOT_ALIVE_DISPOSED_INSTANCE_STATE) {
+                // writer says file is finished
+                printf("\nfclose(): %s\n", cur.filename);
+                fclose(currentFile);
+            }
+        }
+    }
+
+    retcode = file_xfer_reader->return_loan(data_seq, info_seq);
+    if (retcode != DDS_RETCODE_OK) {
+        printf("return loan error %d\n", retcode);
+    }
+}
+
 extern "C" int subscriber_main(int domainId, int sample_count)
 {
     DDSDomainParticipant *participant = NULL;
@@ -203,12 +289,17 @@ extern "C" int subscriber_main(int domainId, int sample_count)
 
     /* Create a data reader listener */
     reader_listener = new file_xferListener();
+    if (reader_listener == NULL) {
+        printf("Could not instantiate listener\n");
+        subscriber_shutdown(participant);
+        return -1;
+    }
 
     /* To customize the data reader QoS, use 
     the configuration file USER_QOS_PROFILES.xml */
     reader = subscriber->create_datareader(
         topic, DDS_DATAREADER_QOS_DEFAULT, reader_listener,
-        DDS_STATUS_MASK_ALL);
+        DDS_STATUS_MASK_NONE);
     if (reader == NULL) {
         fprintf(stderr, "create_datareader error\n");
         subscriber_shutdown(participant);
@@ -216,16 +307,68 @@ extern "C" int subscriber_main(int domainId, int sample_count)
         return -1;
     }
 
-    /* Main loop */
-    for (count=0; (sample_count == 0) || (count < sample_count); ++count) {
-
-        printf("file_xfer subscriber sleeping for %d sec...\n",
-        receive_period.sec);
-
-        NDDSUtility::sleep(receive_period);
+    // Get a pointer to the strongly-typed data reader to pass into the processing routine
+    file_xferDataReader *file_xfer_reader = file_xferDataReader::narrow(reader);
+    if (file_xfer_reader == NULL) {
+        fprintf(stderr, "DataReader narrow error\n");
+        return -1;
     }
 
-    /* Delete all entities */
+    // Create status condition
+    DDSStatusCondition *status_condition = reader->get_statuscondition();
+    if (status_condition == NULL)
+    {
+        printf("get_statuscondition error\n");
+        subscriber_shutdown(participant);
+        return -1;
+    }
+
+    // Since a single status condition can match many statuses, 
+    // enable only those we're interested in.
+    retcode = status_condition->set_enabled_statuses(DDS_DATA_AVAILABLE_STATUS);
+    if (retcode != DDS_RETCODE_OK) {
+        printf("set_enabled_statuses error\n");
+        subscriber_shutdown(participant);
+        return -1;
+    }
+    
+    // Create WaitSet, and attach conditions
+    DDSWaitSet* waitset = new DDSWaitSet();
+
+    retcode = waitset->attach_condition(status_condition);
+    if (retcode != DDS_RETCODE_OK) {
+        printf("attach_condition error\n");
+        subscriber_shutdown(participant);
+        return -1;
+    }    
+
+    const DDS_Duration_t timeout = {10,0};
+
+    // Process inbound file
+    // Process data
+    while (true) {
+        DDSConditionSeq active_conditions; 
+
+        // The triggered condition(s) will be placed in active_conditions
+        retcode = waitset->wait(active_conditions, timeout);
+        
+        if (retcode == DDS_RETCODE_TIMEOUT) {
+            continue;
+        } else if (retcode != DDS_RETCODE_OK) {
+            printf("wait returned error: %d\n", retcode);
+            break;
+        }
+        
+        // See which conditions triggered
+        for (int i = 0; i < active_conditions.length(); ++i) {
+            if (active_conditions[i] == status_condition) {
+                process_data(file_xfer_reader);
+            }
+        }
+    }
+
+    // Clean up by deleting all created entities
+    delete waitset;
     status = subscriber_shutdown(participant);
     delete reader_listener;
 

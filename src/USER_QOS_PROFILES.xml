@@ -159,6 +159,19 @@ XML" chapter in the RTI Connext DDS Core Libraries User's Manual.
                     <role_name>FileXferParticipantRole</role_name>
                 </participant_name>
 
+                <transport_builtin>
+                    <mask>UDPv4</mask>
+                </transport_builtin>
+
+                <property>
+                    <value>
+                        <element>
+                            <name>dds.transport.UDPv4.builtin.parent.deny_interfaces_list</name>
+                            <value>192.168.1.*</value>
+                        </element>
+                    </value>
+                </property>
+
             </participant_qos>
         </qos_profile>
 
