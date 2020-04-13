@@ -215,7 +215,7 @@ extern "C" int publisher_main(int domainId, int sample_count)
     }
 
     flowProperty.token_bucket.period.sec                = 0;
-    flowProperty.token_bucket.period.nanosec            = 500000000;   // 100 ms
+    flowProperty.token_bucket.period.nanosec            = 100000000;   // 100 ms
     flowProperty.token_bucket.bytes_per_token           = 1024;
     flowProperty.token_bucket.max_tokens                = 100;
     flowProperty.token_bucket.tokens_added_per_period   = 100;
