@@ -87,6 +87,8 @@ static int publisher_shutdown(
 */
 int send_file(const char* filename, file_xferDataWriter* writer) {
     DDS_ReturnCode_t retcode;
+    DDS_LongLong pct_remain;
+    DDS_LongLong last_pct_remain = 101;
 
     file_xfer *instance = file_xferTypeSupport::create_data();
 
@@ -143,6 +145,19 @@ int send_file(const char* filename, file_xferDataWriter* writer) {
                 return -4;
             }
         } while (retcode == DDS_RETCODE_TIMEOUT);
+
+        pct_remain = (DDS_LongLong) ((DDS_LongLong) instance->remaining_bytes * 100) / (DDS_LongLong)instance->total_bytes;
+        //printf("%d %d %d\n", cur.total_bytes, cur.remaining_bytes, pct_complete);
+        if (pct_remain != last_pct_remain)
+        {
+            if (pct_remain % 10 == 0) 
+            {
+                //printf("Rem: %lld  %lld\n", pct_remain, last_pct_remain);
+                printf("Rem: %lld\n", pct_remain );
+                last_pct_remain = pct_remain;
+            }
+        }
+
     }
 
     DDS_Duration_t timeout = {10, 0};
@@ -206,6 +221,8 @@ extern "C" int publisher_main(int domainId, int sample_count)
         return -1;
     }
 
+    /*
+
     // Get the properties for the default flow controller on the participant and tweak them
     retcode = participant->get_default_flowcontroller_property(flowProperty);
     if (retcode != DDS_RETCODE_OK)
@@ -226,6 +243,8 @@ extern "C" int publisher_main(int domainId, int sample_count)
         printf("flow controller error\n");
         return -1;
     }
+    */
+
 
     /* To customize publisher QoS, use 
     the configuration file USER_QOS_PROFILES.xml */
